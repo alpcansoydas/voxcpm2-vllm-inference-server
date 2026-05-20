@@ -26,10 +26,7 @@ RUN git clone --branch v0.20.0 --depth 1 \
       https://github.com/vllm-project/vllm-omni.git /opt/vllm-omni \
  && uv pip install --no-cache -e /opt/vllm-omni
 
-# VoxCPM source tree (provides the voxcpm Python package)
 WORKDIR /app
-COPY VoxCPM/ ./VoxCPM/
-RUN uv pip install --no-cache -e ./VoxCPM
 
 # UI server dependencies (FastAPI, uvicorn, httpx, …)
 COPY requirements.txt ./
