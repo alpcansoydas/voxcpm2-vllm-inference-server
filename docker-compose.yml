@@ -1,0 +1,38 @@
+version: "3.9"
+
+# Usage:
+#   docker compose up --build
+#   MODEL_ID=/models/VoxCPM2 docker compose up  # local weights (see volumes below)
+
+services:
+  voxcpm2:
+    build:
+      context: .
+    image: voxcpm2-vllm
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_ID: ${MODEL_ID:-openbmb/VoxCPM2}
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      # Persist downloaded model weights across container restarts
+      - hf_cache:/root/.cache/huggingface
+      # Uncomment to use locally downloaded weights instead of fetching from HF:
+      # - /path/to/local/VoxCPM2:/models/VoxCPM2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+volumes:
+  hf_cache:
