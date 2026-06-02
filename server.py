@@ -8,7 +8,6 @@ import logging
 import os
 import re
 import struct
-import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -29,7 +28,7 @@ logger = logging.getLogger("voxcpm2")
 _VLLM_URL = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
 _MODEL_ID = os.environ.get("MODEL_ID", "openbmb/VoxCPM2")
 
-_UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", tempfile.mkdtemp(prefix="voxcpm_uploads_")))
+_UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/voxcpm_uploads"))
 _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 _MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 50 * 1024 * 1024))  # 50 MB

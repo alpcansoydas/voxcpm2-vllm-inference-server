@@ -56,11 +56,13 @@ git clone --branch v0.20.0 --depth 1 \
 pip install -e /tmp/vllm-omni
 ```
 
-### 3. Install server dependencies
+### 3. Install server and model dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
+
+`requirements.txt` includes `voxcpm>=2.0` which is required by vllm-omni at runtime.
 
 ### 4. Run
 
