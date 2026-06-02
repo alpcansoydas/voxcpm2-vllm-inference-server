@@ -1,6 +1,9 @@
 #!/bin/sh
 set -e
 
+MODEL_ID="${MODEL_ID:-openbmb/VoxCPM2}"
+export MODEL_ID
+
 UPLOAD_DIR="${UPLOAD_DIR:-/tmp/voxcpm_uploads}"
 mkdir -p "$UPLOAD_DIR"
 export UPLOAD_DIR
