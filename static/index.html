@@ -487,7 +487,7 @@ function onVoiceChange() {
   const voice = document.getElementById('preset-voice').value;
   const emotions = presetsData.filter(p => p.lang === lang && p.voice === voice);
   const eSel = document.getElementById('preset-emotion');
-  eSel.innerHTML = emotions.map(e => `<option value="${e.server_path}" data-url="${e.preview_url}">${e.emotion.replace(/_/g,' ')}</option>`).join('');
+  eSel.innerHTML = emotions.map(e => `<option value="${e.id}" data-url="${e.preview_url}">${e.emotion.replace(/_/g,' ')}</option>`).join('');
   updatePresetName();
 }
 

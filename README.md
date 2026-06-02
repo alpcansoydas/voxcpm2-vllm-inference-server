@@ -35,6 +35,19 @@ Pass a HuggingFace token if the repo requires authentication:
 HF_TOKEN=hf_... docker compose up --build
 ```
 
+## Configuration (environment variables)
+
+| Variable | Default | Description |
+|---|---|---|
+| `MODEL_ID` | `openbmb/VoxCPM2` | HF repo or local path |
+| `HF_TOKEN` | — | HuggingFace access token |
+| `MAX_UPLOAD_BYTES` | `52428800` (50 MB) | Max upload file size |
+| `UPLOAD_TTL_SECONDS` | `3600` (1 hour) | Uploaded files auto-deleted after this |
+| `MAX_CONCURRENT_STREAMS` | `8` | Max parallel TTS generation streams |
+| `CORS_ORIGINS` | `*` | Comma-separated allowed origins |
+| `VLLM_CONNECT_TIMEOUT` | `10.0` | Timeout connecting to vllm backend (s) |
+| `VLLM_READ_TIMEOUT` | `300.0` | Timeout waiting for vllm response (s) |
+
 ## Web UI
 
 Once you see `Application startup complete` in the logs, open:
@@ -74,8 +87,8 @@ The container exposes a single port (8000) with these endpoints:
 |---|---|---|
 | `/` | GET | Web UI |
 | `/health` | GET | Model readiness (`model_loaded: true/false`) |
-| `/upload-audio` | POST | Upload reference audio, returns `file_id` path |
-| `/ws/stream` | WebSocket | Streaming TTS (see below) |
+| `/upload-audio` | POST | Upload reference audio, returns opaque `file_id` |
+| `/api/stream` | POST | Streaming TTS (binary frame protocol) |
 | `/api/presets` | GET | List bundled voice presets |
 | `/voice-presets/{lang}/{voice}/{file}` | GET | Serve preset WAV files |
 
@@ -86,12 +99,26 @@ curl http://localhost:8000/health
 # {"status":"ok","model_loaded":true,"model_id":"openbmb/VoxCPM2"}
 ```
 
-### WebSocket streaming protocol
+### Upload audio
 
-Connect to `ws://localhost:8000/ws/stream`, send a JSON params message, receive:
+```bash
+curl -F file=@reference.wav http://localhost:8000/upload-audio
+# {"file_id": "a3f1b2c4-..."}
+```
 
+Returns an opaque `file_id` (not a filesystem path). Use this ID as `reference_wav_path` or `prompt_wav_path` in stream requests. Uploads expire after `UPLOAD_TTL_SECONDS`.
+
+### Streaming protocol (`/api/stream`)
+
+POST JSON params, receive a binary stream with length-prefixed frames:
+
+**Frame format:** `[type: u8][length: u32 LE][payload: bytes]`
+- type `0` → JSON control message
+- type `1` → float32-LE PCM audio samples
+
+**Sequence:**
 1. `{"type": "meta", "sample_rate": 48000}` — audio format header
-2. Binary frames — float32-LE PCM chunks (stream in real time)
+2. Binary audio frames — float32-LE PCM chunks (streamed in real time)
 3. `{"type": "done", "chunks": N}` — end of stream
 4. `{"type": "error", "message": "..."}` — on failure
 
@@ -101,17 +128,18 @@ Connect to `ws://localhost:8000/ws/stream`, send a JSON params message, receive:
 |---|---|---|---|
 | `text` | string | required | Text to synthesize |
 | `control` | string | `""` | Emotion/style instruction (Voice Design) |
-| `reference_wav_path` | string | — | File path returned by `/upload-audio` |
+| `reference_wav_path` | string | — | Opaque ID from `/upload-audio` or preset `id` |
 | `prompt_wav_path` | string | — | Same as reference, for Ultimate Clone |
 | `prompt_text` | string | — | Exact transcript of prompt audio |
-| `cfg_value` | float | `2.0` | Classifier-free guidance scale |
-| `inference_timesteps` | int | `10` | Diffusion steps (speed vs quality) |
-| `min_len` / `max_len` | int | `2` / `4096` | Output length bounds (tokens) |
-| `normalize` | bool | `false` | Text normalization (numbers, dates) |
-| `denoise` | bool | `false` | Denoise reference audio |
-| `retry_badcase` | bool | `true` | Auto-retry poor quality outputs |
-| `retry_badcase_max_times` | int | `3` | Max retries |
-| `retry_badcase_ratio_threshold` | float | `6.0` | Retry quality threshold |
+| `max_len` | int | `4096` | Max output length (tokens, capped at 8192) |
+
+### Presets
+
+```bash
+curl http://localhost:8000/api/presets
+```
+
+Returns presets with an opaque `id` field. Use this `id` as `reference_wav_path` in stream requests.
 
 ## Stopping
 

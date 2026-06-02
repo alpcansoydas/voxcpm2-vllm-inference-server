@@ -1,5 +1,3 @@
-version: "3.9"
-
 # Usage:
 #   docker compose up --build
 #   MODEL_ID=/models/VoxCPM2 docker compose up  # local weights (see volumes below)
@@ -14,6 +12,10 @@ services:
     environment:
       MODEL_ID: ${MODEL_ID:-openbmb/VoxCPM2}
       HF_TOKEN: ${HF_TOKEN:-}
+      UPLOAD_DIR: /tmp/voxcpm_uploads
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-52428800}
+      MAX_CONCURRENT_STREAMS: ${MAX_CONCURRENT_STREAMS:-8}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
     volumes:
       # Persist downloaded model weights across container restarts
       - hf_cache:/root/.cache/huggingface

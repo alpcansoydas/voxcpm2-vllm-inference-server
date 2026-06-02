@@ -2,11 +2,14 @@
 """VoxCPM2 FastAPI UI server — proxies inference to a vllm-omni backend."""
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import re
 import struct
 import tempfile
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,24 +17,53 @@ from typing import Tuple
 
 import httpx
 import numpy as np
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-_VLLM_URL = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
-_MODEL_ID  = os.environ.get("MODEL_ID", "openbmb/VoxCPM2")
-_TMP_DIR   = Path(tempfile.mkdtemp(prefix="voxcpm_uploads_"))
+logger = logging.getLogger("voxcpm2")
 
-# Persistent HTTP client reused across requests to avoid per-request TCP
-# connection setup when proxying to vllm-omni on localhost.
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+_VLLM_URL = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
+_MODEL_ID = os.environ.get("MODEL_ID", "openbmb/VoxCPM2")
+
+_UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", tempfile.mkdtemp(prefix="voxcpm_uploads_")))
+_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+_MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 50 * 1024 * 1024))  # 50 MB
+_UPLOAD_TTL_SECONDS = int(os.environ.get("UPLOAD_TTL_SECONDS", 3600))  # 1 hour
+_ALLOWED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".webm"}
+
+_MAX_CONCURRENT_STREAMS = int(os.environ.get("MAX_CONCURRENT_STREAMS", 8))
+_VLLM_CONNECT_TIMEOUT = float(os.environ.get("VLLM_CONNECT_TIMEOUT", 30.0))
+_VLLM_READ_TIMEOUT = float(os.environ.get("VLLM_READ_TIMEOUT", 300.0))
+
+_PRESETS_DIR = Path(__file__).parent / "voice_presets"
+
+# ── Runtime state ─────────────────────────────────────────────────────────────
+
 _http_client: httpx.AsyncClient | None = None
+_stream_semaphore: asyncio.Semaphore | None = None
+_upload_registry: dict[str, Path] = {}  # opaque_id → absolute path
+_preset_registry: dict[str, Path] = {}  # opaque_id → absolute path
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    global _http_client
-    _http_client = httpx.AsyncClient(timeout=None)
+    global _http_client, _stream_semaphore
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            connect=_VLLM_CONNECT_TIMEOUT,
+            read=_VLLM_READ_TIMEOUT,
+            write=30.0,
+            pool=10.0,
+        )
+    )
+    _stream_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_STREAMS)
+    _build_preset_registry()
+    _schedule_upload_cleanup()
     yield
     await _http_client.aclose()
     _http_client = None
@@ -40,62 +72,114 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(title="VoxCPM2 Streaming Server", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 
-# ── WAV utilities ──────────────────────────────────────────────────────────────
+# ── Upload cleanup ────────────────────────────────────────────────────────────
+
+_cleanup_task: asyncio.Task | None = None
+
+
+def _schedule_upload_cleanup():
+    global _cleanup_task
+    _cleanup_task = asyncio.create_task(_upload_cleanup_loop())
+
+
+async def _upload_cleanup_loop():
+    while True:
+        await asyncio.sleep(300)  # every 5 minutes
+        now = time.time()
+        expired = []
+        for fid, fpath in list(_upload_registry.items()):
+            try:
+                if fpath.exists() and (now - fpath.stat().st_mtime) > _UPLOAD_TTL_SECONDS:
+                    fpath.unlink(missing_ok=True)
+                    expired.append(fid)
+            except OSError:
+                expired.append(fid)
+        for fid in expired:
+            _upload_registry.pop(fid, None)
+        if expired:
+            logger.info("Cleaned %d expired uploads", len(expired))
+
+
+# ── Preset registry ───────────────────────────────────────────────────────────
+
+def _build_preset_registry():
+    """Map each preset WAV to an opaque ID so clients never see server paths."""
+    if not _PRESETS_DIR.exists():
+        return
+    for wav_file in _PRESETS_DIR.rglob("*.wav"):
+        rel = wav_file.relative_to(_PRESETS_DIR)
+        opaque_id = f"preset:{rel.as_posix()}"
+        _preset_registry[opaque_id] = wav_file.resolve()
+
+
+def _resolve_audio_id(audio_id: str) -> Path | None:
+    """Resolve an opaque audio ID to a validated absolute path."""
+    if not audio_id:
+        return None
+    if audio_id.startswith("preset:"):
+        return _preset_registry.get(audio_id)
+    return _upload_registry.get(audio_id)
+
+
+# ── WAV utilities ─────────────────────────────────────────────────────────────
 
 def _parse_wav_header(data: bytes) -> Tuple[int, int, int, int]:
     """
     Scan a WAV buffer for the data chunk.
     Returns (data_offset, sample_rate, bits_per_sample, audio_format).
-    audio_format: 1 = PCM int, 3 = IEEE float.
-    Handles extra chunks (LIST, fact, …) before the data chunk.
     """
+    if len(data) < 44:
+        raise ValueError("WAV buffer too small")
     if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise ValueError("Not a RIFF/WAVE file")
     if data[12:16] != b"fmt ":
         raise ValueError("Expected fmt chunk at offset 12")
 
-    fmt_size       = struct.unpack_from("<I", data, 16)[0]
-    audio_format   = struct.unpack_from("<H", data, 20)[0]
-    sample_rate    = struct.unpack_from("<I", data, 24)[0]
+    fmt_size = struct.unpack_from("<I", data, 16)[0]
+    audio_format = struct.unpack_from("<H", data, 20)[0]
+    sample_rate = struct.unpack_from("<I", data, 24)[0]
     bits_per_sample = struct.unpack_from("<H", data, 34)[0]
 
-    # Scan forward for the "data" sub-chunk
-    pos = 12 + 8 + fmt_size          # past WAVE marker + fmt header + fmt body
+    pos = 12 + 8 + fmt_size
     while pos + 8 <= len(data):
-        chunk_id   = data[pos : pos + 4]
+        chunk_id = data[pos:pos + 4]
         chunk_size = struct.unpack_from("<I", data, pos + 4)[0]
         if chunk_id == b"data":
             return pos + 8, sample_rate, bits_per_sample, audio_format
-        pos += 8 + chunk_size + (chunk_size % 2)   # chunks are word-aligned
+        pos += 8 + chunk_size + (chunk_size % 2)
 
     raise ValueError("WAV data chunk not found")
 
 
 def _pcm_to_float32(pcm: bytes, bits_per_sample: int, audio_format: int) -> np.ndarray:
     """Convert raw PCM bytes to float32 samples in [-1, 1]."""
-    if audio_format == 3 or bits_per_sample == 32:          # IEEE float32
+    if audio_format == 3 or bits_per_sample == 32:
         return np.frombuffer(pcm, dtype=np.float32).copy()
     elif bits_per_sample == 16:
         return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     elif bits_per_sample == 24:
-        # 24-bit is awkward — unpack manually
-        arr = np.zeros(len(pcm) // 3, dtype=np.float32)
-        for i in range(len(arr)):
-            b = pcm[i*3 : i*3+3]
-            val = struct.unpack("<i", b + (b"\xff" if b[2] & 0x80 else b"\x00"))[0] >> 8
-            arr[i] = val / 8388608.0
-        return arr
+        n_samples = len(pcm) // 3
+        raw = np.frombuffer(pcm, dtype=np.uint8).reshape(n_samples, 3)
+        # Reconstruct 32-bit signed integers from 24-bit LE samples
+        i32 = (
+            raw[:, 0].astype(np.int32)
+            | (raw[:, 1].astype(np.int32) << 8)
+            | (raw[:, 2].astype(np.int32) << 16)
+        )
+        # Sign-extend from 24-bit
+        i32[i32 >= 0x800000] -= 0x1000000
+        return (i32 / 8388608.0).astype(np.float32)
     else:
         raise ValueError(f"Unsupported bits_per_sample={bits_per_sample}")
 
 
-# ── HTTP Endpoints ─────────────────────────────────────────────────────────────
+# ── HTTP Endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -105,30 +189,41 @@ async def health():
     except Exception:
         ready = False
     return {
-        "status":       "ok" if ready else "loading",
+        "status": "ok" if ready else "loading",
         "model_loaded": ready,
-        "model_id":     _MODEL_ID,
+        "model_id": _MODEL_ID,
     }
 
 
 @app.post("/upload-audio")
 async def upload_audio(file: UploadFile = File(...)):
-    suffix = Path(file.filename or "audio").suffix or ".wav"
-    fid    = str(uuid.uuid4())
-    dest   = _TMP_DIR / f"{fid}{suffix}"
-    dest.write_bytes(await file.read())
-    return {"file_id": str(dest)}
+    filename = file.filename or "audio.wav"
+    suffix = Path(filename).suffix.lower()
+    if suffix not in _ALLOWED_AUDIO_EXTENSIONS:
+        raise HTTPException(400, f"Unsupported audio format: {suffix}")
+
+    fid = str(uuid.uuid4())
+    dest = _UPLOAD_DIR / f"{fid}{suffix}"
+
+    size = 0
+    with dest.open("wb") as f:
+        while chunk := await file.read(64 * 1024):
+            size += len(chunk)
+            if size > _MAX_UPLOAD_BYTES:
+                dest.unlink(missing_ok=True)
+                raise HTTPException(413, f"File exceeds {_MAX_UPLOAD_BYTES // (1024*1024)} MB limit")
+            f.write(chunk)
+
+    _upload_registry[fid] = dest.resolve()
+    return {"file_id": fid}
 
 
-# ── HTTP streaming ─────────────────────────────────────────────────────────────
-# Frame format (length-prefixed binary):
-#   [type: u8][length: u32 LE][payload: bytes]
-#   type 0 → JSON  ({"type":"meta"|"done"|"error", ...})
-#   type 1 → float32-LE PCM audio samples
+# ── HTTP streaming ────────────────────────────────────────────────────────────
 
 def _json_frame(obj: dict) -> bytes:
     payload = json.dumps(obj).encode()
     return b"\x00" + struct.pack("<I", len(payload)) + payload
+
 
 def _audio_frame(data: bytes) -> bytes:
     return b"\x01" + struct.pack("<I", len(data)) + data
@@ -153,43 +248,46 @@ async def api_stream(request: Request):
         if control:
             text = f"({control}){text}"
 
-        ref_path    = params.get("reference_wav_path") or ""
-        prompt_path = params.get("prompt_wav_path") or ""
+        ref_id = (params.get("reference_wav_path") or "").strip()
+        prompt_id = (params.get("prompt_wav_path") or "").strip()
         prompt_text = (params.get("prompt_text") or "").strip()
 
-        valid_ref    = ref_path    and Path(ref_path).exists()
-        valid_prompt = prompt_path and Path(prompt_path).exists() and prompt_text
+        ref_path = _resolve_audio_id(ref_id)
+        prompt_path = _resolve_audio_id(prompt_id) if prompt_id else None
 
-        # Build OpenAI-compatible /v1/audio/speech request for vllm-omni VoxCPM2.
-        # vllm-omni uses `ref_audio` (file:// URI, data: URL, or http URL) and
-        # `ref_text` — NOT the VoxCPM-native `reference_wav_path`/`prompt_wav_path`.
-        # `max_new_tokens` maps to max audio token budget (≈ max_len in the old API).
-        # `stream=True` is critical: without it vllm-omni awaits the entire audio
-        # before sending any bytes (TTFT ≈ total latency).
+        valid_ref = ref_path is not None and ref_path.exists()
+        valid_prompt = prompt_path is not None and prompt_path.exists() and prompt_text
+
         request_body: dict = {
-            "model":           "voxcpm2",
-            "input":           text,
+            "model": "voxcpm2",
+            "input": text,
             "response_format": "wav",
-            "stream":          True,
-            "max_new_tokens":  int(params.get("max_len", 4096)),
+            "stream": True,
+            "max_new_tokens": min(int(params.get("max_len", 4096)), 8192),
         }
 
-        # Continuation (Ultimate Cloning): prompt audio + transcript
         if valid_prompt:
-            request_body["ref_audio"] = Path(prompt_path).as_uri()
-            request_body["ref_text"]  = prompt_text
-        # Controllable Cloning / Preset: reference audio only
+            request_body["ref_audio"] = prompt_path.as_uri()
+            request_body["ref_text"] = prompt_text
         elif valid_ref:
-            request_body["ref_audio"] = Path(ref_path).as_uri()
+            request_body["ref_audio"] = ref_path.as_uri()
 
-        chunk_count      = 0
-        header_done      = False
-        buf              = bytearray()
-        sample_rate      = 48000
-        bits             = 16
-        audio_fmt        = 1
-        data_offset      = 44
+        chunk_count = 0
+        header_done = False
+        buf = bytearray()
+        sample_rate = 48000
+        bits = 16
+        audio_fmt = 1
+        data_offset = 44
         bytes_per_sample = 2
+
+        acquired = _stream_semaphore.acquire() if _stream_semaphore else None
+        if acquired:
+            try:
+                await asyncio.wait_for(acquired, timeout=30.0)
+            except asyncio.TimeoutError:
+                yield _json_frame({"type": "error", "message": "server busy, try again later"})
+                return
 
         try:
             async with _http_client.stream(
@@ -200,7 +298,7 @@ async def api_stream(request: Request):
                 if resp.status_code != 200:
                     body = await resp.aread()
                     yield _json_frame({
-                        "type":    "error",
+                        "type": "error",
                         "message": f"vllm-omni error {resp.status_code}: "
                                    f"{body[:300].decode(errors='replace')}",
                     })
@@ -209,7 +307,6 @@ async def api_stream(request: Request):
                 async for raw in resp.aiter_bytes(chunk_size=4096):
                     buf.extend(raw)
 
-                    # Parse WAV header once we have enough bytes (44 = minimal WAV header)
                     if not header_done and len(buf) >= 44:
                         try:
                             data_offset, sample_rate, bits, audio_fmt = _parse_wav_header(bytes(buf))
@@ -224,35 +321,46 @@ async def api_stream(request: Request):
                     if not header_done:
                         continue
 
-                    # Flush complete samples from buffer (avoid splitting a sample)
                     n_bytes = (len(buf) // bytes_per_sample) * bytes_per_sample
                     if n_bytes >= bytes_per_sample * 256:
                         pcm_bytes = bytes(buf[:n_bytes])
                         buf = buf[n_bytes:]
-                        float32 = _pcm_to_float32(pcm_bytes, bits, audio_fmt)
+                        float32 = await asyncio.to_thread(
+                            _pcm_to_float32, pcm_bytes, bits, audio_fmt
+                        )
                         yield _audio_frame(float32.tobytes())
                         chunk_count += 1
 
-                # Flush any remaining samples
                 if header_done:
                     n_bytes = (len(buf) // bytes_per_sample) * bytes_per_sample
                     if n_bytes >= bytes_per_sample:
                         pcm_bytes = bytes(buf[:n_bytes])
-                        float32 = _pcm_to_float32(pcm_bytes, bits, audio_fmt)
+                        float32 = await asyncio.to_thread(
+                            _pcm_to_float32, pcm_bytes, bits, audio_fmt
+                        )
                         yield _audio_frame(float32.tobytes())
                         chunk_count += 1
 
+        except httpx.ConnectError:
+            yield _json_frame({"type": "error", "message": "backend unavailable"})
+            return
+        except httpx.ReadTimeout:
+            yield _json_frame({"type": "error", "message": "backend timed out"})
+            return
         except Exception as exc:
+            logger.exception("Stream error")
             yield _json_frame({"type": "error", "message": str(exc)})
             return
+        finally:
+            if _stream_semaphore:
+                _stream_semaphore.release()
 
         yield _json_frame({"type": "done", "chunks": chunk_count})
 
     return StreamingResponse(generate(), media_type="application/octet-stream")
 
 
-# ── Voice presets API ──────────────────────────────────────────────────────────
-_PRESETS_DIR = Path(__file__).parent / "voice_presets"
+# ── Voice presets API ─────────────────────────────────────────────────────────
 
 _LANG_NAMES = {
     "ar": "Arabic", "de": "German", "en": "English", "es": "Spanish",
@@ -283,18 +391,22 @@ async def get_presets():
                 if parts and parts[0] in ("child", "man", "woman"):
                     parts = parts[1:]
                 emotion_label = "_".join(parts) if parts else emotion
+
+                rel = wav_file.relative_to(_PRESETS_DIR)
+                opaque_id = f"preset:{rel.as_posix()}"
+
                 presets.append({
-                    "lang":        lang,
-                    "lang_name":   _LANG_NAMES.get(lang, lang.upper()),
-                    "voice":       voice,
-                    "emotion":     emotion_label,
+                    "lang": lang,
+                    "lang_name": _LANG_NAMES.get(lang, lang.upper()),
+                    "voice": voice,
+                    "emotion": emotion_label,
                     "preview_url": f"/voice-presets/{lang}/{voice}/{wav_file.name}",
-                    "server_path": str(wav_file.absolute()),
+                    "id": opaque_id,
                 })
     return {"presets": presets}
 
 
-# ── Static files ───────────────────────────────────────────────────────────────
+# ── Static files ──────────────────────────────────────────────────────────────
 _STATIC = Path(__file__).parent / "static"
 _STATIC.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
@@ -308,14 +420,14 @@ async def index():
     return FileResponse(str(_STATIC / "index.html"))
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
     import uvicorn
 
     p = argparse.ArgumentParser(description="VoxCPM2 UI server")
-    p.add_argument("--host",     default="0.0.0.0")
-    p.add_argument("--port",     type=int, default=8000)
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8000)
     p.add_argument("--vllm-url", default="http://127.0.0.1:8001",
                    help="Base URL of the vllm-omni backend")
     args = p.parse_args()
