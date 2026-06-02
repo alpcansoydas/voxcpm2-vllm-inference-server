@@ -5,7 +5,8 @@ UPLOAD_DIR="${UPLOAD_DIR:-/tmp/voxcpm_uploads}"
 mkdir -p "$UPLOAD_DIR"
 export UPLOAD_DIR
 
-PRESETS_DIR="/app/voice_presets"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PRESETS_DIR="${PRESETS_DIR:-$SCRIPT_DIR/voice_presets}"
 
 # Start vllm-omni on internal port 8001.
 # --allowed-local-media-path is restricted to uploads + presets only.

@@ -1,6 +1,6 @@
-# VoxCPM2 — Docker TTS Server with Web UI
+# VoxCPM2 — TTS Server with Web UI
 
-Serves [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) (2B tokenizer-free TTS, 48kHz) inside a single Docker container.
+Serves [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) (2B tokenizer-free TTS, 48kHz) via Docker or bare-metal.
 
 **Architecture inside the container:**
 
@@ -17,11 +17,13 @@ Browser → port 8000 → server.py (FastAPI UI + proxy)
 
 ## Requirements
 
-- Docker with [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
 - NVIDIA GPU with ~6 GB VRAM + headroom
-- ~5 GB free disk for the Docker image; ~9 GB for model weights
+- ~9 GB free disk for model weights
+- Python 3.10+, `ffmpeg`, and `libsndfile` installed on the host
 
-## Build & Run
+## Option A — Docker (recommended)
+
+Requires Docker with [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) and ~5 GB extra disk for the image.
 
 ```bash
 docker compose up --build
@@ -33,6 +35,62 @@ Pass a HuggingFace token if the repo requires authentication:
 
 ```bash
 HF_TOKEN=hf_... docker compose up --build
+```
+
+## Option B — Run without Docker
+
+### 1. Create a virtual environment
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### 2. Install vLLM and vllm-omni
+
+```bash
+pip install vllm==0.20.0
+
+git clone --branch v0.20.0 --depth 1 \
+  https://github.com/vllm-project/vllm-omni.git /tmp/vllm-omni
+pip install -e /tmp/vllm-omni
+```
+
+### 3. Install server dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Run
+
+```bash
+export MODEL_ID=openbmb/VoxCPM2
+# export HF_TOKEN=hf_...   # if the repo requires authentication
+bash start.sh
+```
+
+This starts vllm-omni on internal port 8001 and the FastAPI UI on port 8000.
+
+You can also start each component manually in separate terminals:
+
+```bash
+# Terminal 1 — vLLM backend
+export UPLOAD_DIR="/tmp/voxcpm_uploads"
+mkdir -p "$UPLOAD_DIR"
+
+vllm-omni serve openbmb/VoxCPM2 \
+  --omni \
+  --host 127.0.0.1 \
+  --port 8001 \
+  --trust-remote-code \
+  --served-model-name voxcpm2 \
+  --allowed-local-media-path "$UPLOAD_DIR" \
+  --allowed-local-media-path ./voice_presets
+
+# Terminal 2 — FastAPI server
+export UPLOAD_DIR="/tmp/voxcpm_uploads"
+python server.py --host 0.0.0.0 --port 8000 --vllm-url http://127.0.0.1:8001
 ```
 
 ## Configuration (environment variables)
@@ -143,12 +201,14 @@ Returns presets with an opaque `id` field. Use this `id` as `reference_wav_path`
 
 ## Stopping
 
+**Docker:**
+
 ```bash
 docker compose down
-```
-
-Remove cached weights too:
-
-```bash
+# Remove cached weights too:
 docker compose down -v
 ```
+
+**Without Docker:**
+
+Press `Ctrl+C` in the terminal running `start.sh` — it will clean up both processes automatically.
