@@ -48,18 +48,24 @@ source venv/bin/activate
 
 ### 2. Install vLLM and vllm-omni
 
+Install with [`uv`](https://github.com/astral-sh/uv) and `--torch-backend=auto` so the
+correct `torch`+CUDA wheel is selected for your GPU. Plain `pip install vllm` pulls a
+default-pinned torch build that may not match the host's CUDA driver, causing CUDA
+version mismatch errors at startup (common on cloud GPU hosts such as vast.ai).
+
 ```bash
-pip install vllm==0.20.0
+pip install uv
+uv pip install "vllm==0.20.0" --torch-backend=auto
 
 git clone --branch v0.20.0 --depth 1 \
   https://github.com/vllm-project/vllm-omni.git /tmp/vllm-omni
-pip install -e /tmp/vllm-omni
+uv pip install -e /tmp/vllm-omni
 ```
 
 ### 3. Install server and model dependencies
 
 ```bash
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 ```
 
 `requirements.txt` includes `voxcpm>=2.0` which is required by vllm-omni at runtime.
