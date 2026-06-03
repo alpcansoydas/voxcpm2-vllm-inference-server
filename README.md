@@ -41,8 +41,18 @@ HF_TOKEN=hf_... docker compose up --build
 
 ### 1. Create a virtual environment
 
+> **Cloud GPU hosts (vast.ai, RunPod, …):** these images usually ship a
+> pre-activated base environment (e.g. `/venv/main`, shown as `(main)` in your
+> prompt). **Deactivate it first** and create a fully isolated venv — otherwise
+> the base environment's CUDA libraries stay on `LD_LIBRARY_PATH` and shadow the
+> ones this project installs, producing a `libcudart.so.XX: cannot open shared
+> object file` error at startup (see [Troubleshooting](#troubleshooting)).
+
 ```bash
-python3 -m venv venv
+deactivate 2>/dev/null || true     # leave any pre-existing base env
+unset LD_LIBRARY_PATH              # drop the base env's CUDA lib path
+
+python3 -m venv venv               # plain venv — do NOT use --system-site-packages
 source venv/bin/activate
 ```
 
@@ -61,6 +71,15 @@ git clone --branch v0.20.0 --depth 1 \
   https://github.com/vllm-project/vllm-omni.git /tmp/vllm-omni
 uv pip install -e /tmp/vllm-omni
 ```
+
+Verify the install picked a single, consistent CUDA stack before continuing:
+
+```bash
+python -c "import torch, vllm._C; print('torch CUDA:', torch.version.cuda)"
+```
+
+This must print without error. An `ImportError: libcudart.so.XX` here means the
+CUDA runtime libraries can't be found — see [Troubleshooting](#troubleshooting).
 
 ### 3. Install server and model dependencies
 
@@ -101,6 +120,65 @@ vllm-omni serve openbmb/VoxCPM2 \
 export UPLOAD_DIR="$PWD/uploads"
 python server.py --host 0.0.0.0 --port 8000 --vllm-url http://127.0.0.1:8001
 ```
+
+## Troubleshooting
+
+### `ImportError: libcudart.so.XX: cannot open shared object file`
+
+vllm-omni starts the FastAPI UI but `vllm-omni serve` crashes while importing
+`vllm._C` with an error like:
+
+```
+ImportError: libcudart.so.13: cannot open shared object file: No such file or directory
+```
+
+This is a **CUDA runtime mismatch**: vLLM's compiled extension needs a specific
+CUDA runtime library (here, CUDA 13's `libcudart.so.13`) that the dynamic loader
+can't find in the active environment.
+
+The usual cause on cloud GPU hosts is a **stacked environment**. If your prompt
+shows two environments (e.g. `((venv) ) (main)`) and the traceback mixes paths
+from two locations — your venv for `site-packages` but the base image for the
+Python stdlib:
+
+```
+/workspace/venv/lib/python3.12/site-packages/vllm/platforms/cuda.py
+/venv/main/lib/python3.12/importlib/__init__.py          ← different env
+```
+
+…then the base environment's CUDA libraries are on `LD_LIBRARY_PATH` and are
+shadowing the CUDA wheels this project installed into your venv.
+
+**Fix — rebuild in a clean, isolated environment:**
+
+```bash
+deactivate 2>/dev/null || true
+unset LD_LIBRARY_PATH
+
+rm -rf venv
+python3 -m venv venv          # plain venv, no --system-site-packages
+source venv/bin/activate
+
+pip install uv
+uv pip install "vllm==0.20.0" --torch-backend=auto
+uv pip install -e /tmp/vllm-omni
+uv pip install -r requirements.txt
+```
+
+Then confirm the fix before running `start.sh`:
+
+```bash
+# Loads the compiled extension; must print a CUDA version with no ImportError.
+python -c "import torch, vllm._C; print('torch CUDA:', torch.version.cuda)"
+
+# The matching nvidia-cuda-runtime-cuXX wheel should be present in THIS venv:
+pip list | grep nvidia-cuda-runtime
+```
+
+If `--torch-backend=auto` mis-detects your driver and still picks an
+unavailable CUDA version, pin it explicitly to match your host — check your
+driver with `nvidia-smi` (top-right "CUDA Version") and pass e.g.
+`--torch-backend=cu128` instead of `auto`.
 
 ## Configuration (environment variables)
 
