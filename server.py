@@ -21,6 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from voice_presets_catalog import build_transcript_map
+
 logger = logging.getLogger("voxcpm2")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -28,7 +30,9 @@ logger = logging.getLogger("voxcpm2")
 _VLLM_URL = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
 _MODEL_ID = os.environ.get("MODEL_ID", "openbmb/VoxCPM2")
 
-_UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/voxcpm_uploads"))
+# Default under the app dir so it shares a common parent with voice_presets;
+# vllm-omni's single --allowed-local-media-path must cover both (see start.sh).
+_UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", Path(__file__).parent / "uploads"))
 _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 _MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 50 * 1024 * 1024))  # 50 MB
@@ -47,6 +51,7 @@ _http_client: httpx.AsyncClient | None = None
 _stream_semaphore: asyncio.Semaphore | None = None
 _upload_registry: dict[str, Path] = {}  # opaque_id → absolute path
 _preset_registry: dict[str, Path] = {}  # opaque_id → absolute path
+_preset_transcripts: dict[str, str] = {}  # opaque_id → reference transcript (ref_text)
 
 
 @asynccontextmanager
@@ -108,13 +113,26 @@ async def _upload_cleanup_loop():
 # ── Preset registry ───────────────────────────────────────────────────────────
 
 def _build_preset_registry():
-    """Map each preset WAV to an opaque ID so clients never see server paths."""
+    """Map each preset WAV to an opaque ID so clients never see server paths.
+
+    Also maps the same opaque IDs to their reference transcripts (from the
+    voice preset catalog) so presets can be sent to vllm-omni as ref_audio +
+    ref_text — the high-fidelity cloning path. Presets without a catalog
+    transcript fall back to ref_audio-only conditioning.
+    """
     if not _PRESETS_DIR.exists():
         return
     for wav_file in _PRESETS_DIR.rglob("*.wav"):
         rel = wav_file.relative_to(_PRESETS_DIR)
         opaque_id = f"preset:{rel.as_posix()}"
         _preset_registry[opaque_id] = wav_file.resolve()
+
+    for rel_posix, text in build_transcript_map().items():
+        _preset_transcripts[f"preset:{rel_posix}"] = text
+    logger.info(
+        "Loaded %d presets (%d with transcripts)",
+        len(_preset_registry), len(_preset_transcripts),
+    )
 
 
 def _resolve_audio_id(audio_id: str) -> Path | None:
@@ -270,6 +288,11 @@ async def api_stream(request: Request):
             request_body["ref_text"] = prompt_text
         elif valid_ref:
             request_body["ref_audio"] = ref_path.as_uri()
+            # Presets carry a known transcript: sending it as ref_text engages
+            # VoxCPM2's high-fidelity cloning instead of ref_audio-only.
+            preset_text = _preset_transcripts.get(ref_id)
+            if preset_text:
+                request_body["ref_text"] = preset_text
 
         chunk_count = 0
         header_done = False

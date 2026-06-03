@@ -1,3 +1,6 @@
+# Uploaded reference audio (runtime, served via the app)
+/uploads/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

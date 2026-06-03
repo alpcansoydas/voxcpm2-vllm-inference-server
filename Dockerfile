@@ -34,6 +34,7 @@ RUN uv pip install --no-cache -r requirements.txt
 
 # UI and server files
 COPY server.py ./
+COPY voice_presets_catalog.py ./
 COPY static/ ./static/
 COPY voice_presets/ ./voice_presets/
 

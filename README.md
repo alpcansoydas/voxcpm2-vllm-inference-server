@@ -78,7 +78,9 @@ You can also start each component manually in separate terminals:
 
 ```bash
 # Terminal 1 — vLLM backend
-export UPLOAD_DIR="/tmp/voxcpm_uploads"
+# Uploads and presets must share a common parent, because --allowed-local-media-path
+# only honors a single directory (the last one wins if passed more than once).
+export UPLOAD_DIR="$PWD/uploads"
 mkdir -p "$UPLOAD_DIR"
 
 vllm-omni serve openbmb/VoxCPM2 \
@@ -87,11 +89,10 @@ vllm-omni serve openbmb/VoxCPM2 \
   --port 8001 \
   --trust-remote-code \
   --served-model-name voxcpm2 \
-  --allowed-local-media-path "$UPLOAD_DIR" \
-  --allowed-local-media-path ./voice_presets
+  --allowed-local-media-path "$PWD"
 
 # Terminal 2 — FastAPI server
-export UPLOAD_DIR="/tmp/voxcpm_uploads"
+export UPLOAD_DIR="$PWD/uploads"
 python server.py --host 0.0.0.0 --port 8000 --vllm-url http://127.0.0.1:8001
 ```
 
