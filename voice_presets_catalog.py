@@ -1,6 +1,4 @@
-"""Voice preset catalog for OmniVoice FastAPI service.
-
-Preset audio files live in the zipvoice voice_presets directory.
+"""
 Each preset supplies a ref_audio WAV and matching ref_text transcript,
 replacing any user-uploaded reference audio when a preset is selected.
 """
@@ -16,7 +14,7 @@ _DEFAULT_PRESETS_DIR = Path(__file__).resolve().parent / "voice_presets"
 
 PRESETS_DIR = Path(os.getenv("VOICE_PRESETS_DIR", str(_DEFAULT_PRESETS_DIR)))
 
-# OmniVoice language display name (any case) → preset directory language code
+# Language display name (any case) → preset directory language code
 _LANG_TO_CODE: Dict[str, str] = {
     "english": "en",
     "turkish": "tr",
@@ -35,8 +33,6 @@ _LANG_TO_CODE: Dict[str, str] = {
 }
 
 # Catalog: lang_code → preset_id → {name, emotions: {emotion_id → {file, text}}}
-# Mirrors zipvoice VOICE_PRESETS; kept here so OmniVoice has no runtime
-# dependency on the zipvoice codebase.
 PRESET_CATALOG: Dict[str, Dict] = {
     "tr": {
         "man_voice_ballad": {
@@ -378,7 +374,7 @@ PRESET_CATALOG: Dict[str, Dict] = {
 
 
 def language_to_code(language: str) -> Optional[str]:
-    """Map OmniVoice language display name to a preset directory code."""
+    """Map language display name to a preset directory code."""
     return _LANG_TO_CODE.get((language or "").strip().lower())
 
 
