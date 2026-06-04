@@ -26,6 +26,8 @@ vllm-omni serve "${MODEL_ID}" \
   --port 8001 \
   --trust-remote-code \
   --served-model-name voxcpm2 \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.9}" \
+  --tensor-parallel-size "${TENSOR_PARALLEL_SIZE:-1}" \
   --allowed-local-media-path "$MEDIA_ROOT" &
 
 VLLM_PID=$!
